@@ -1,0 +1,85 @@
+# (c) 2025 Microchip Technology Inc.
+# SPDX-License-Identifier: MIT
+
+FROM ubuntu:24.04
+USER root
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+RUN apt-get update && apt-get install -y lsb-release
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
+    autoconf \
+    bc \
+    bison \
+    build-essential \
+    cmake \
+    cpio \
+    csh \
+    curl \
+    device-tree-compiler \
+    file \
+    flex \
+    gawk \
+    gcc-multilib \
+    g++-multilib \
+    graphviz \
+    git \
+    git-lfs \
+    libattr1-dev \
+    libc6-dev \
+    libcap-ng-dev \
+    libglib2.0-dev \
+    libldap2-dev \
+    libncurses5-dev \
+    libpixman-1-dev \
+    libsasl2-dev \
+    libslirp-dev \
+    libssl-dev \
+    libtool \
+    libzstd-dev \
+    locales \
+    make \
+    nano \
+    perl \
+    ninja-build \
+    pkg-config \
+    pv \
+    rsync \
+    sudo \
+    swig \
+    tcsh \
+    unzip \
+    wget \
+    xxd \
+    u-boot-tools \
+    gnutls-dev \
+    mtools \
+    clang \
+    texinfo \
+    libgmp-dev \
+    libmpfr-dev
+
+
+# Generate the en_US.UTF-8 locale
+RUN locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8
+
+RUN apt-get install -y software-properties-common && add-apt-repository ppa:deadsnakes/ppa && apt-get update && \
+    apt-get install -y python3.12 python3.12-venv python3.12-dev && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 - --break-system-packages && \
+    python3.12 -m pip install --break-system-packages --upgrade pip setuptools wheel xxhash
+
+# Ruby is required for building the sw-lmstax-labs third-party component within the SysC Firmware
+#   - installing ruby is not required to build the remote API or dev_cfg.
+
+RUN apt-get install -y ruby-full libpcap-dev
+RUN gem install nokogiri asciidoctor cbor-diag bit-struct packetfu tar json_schemer rspec rexml serialport webrick
+
+
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt update \
+    && apt install gh -y
+
+ENV USER=root
+WORKDIR /opt/microchip-p64h

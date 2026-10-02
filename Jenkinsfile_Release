@@ -1,0 +1,188 @@
+#! groovy
+// (c) 2026 Microchip Technology Inc.
+// SPDX-License-Identifier: MIT
+
+// Library below is contained in https://bitbucket.microchip.com/projects/HPSC/repos/hpsc-jenkins-lib/browse
+// - use a stable version of the Jenkins library to avoid updates to hpsc-jenkins-lib from retriggering this job.
+@Library('hpsc-jenkins-lib@HPSC-8700-release-2.3.0') _
+
+pipeline {
+    agent {
+        node {
+            label 'hpsc_build_node_alma9_06'
+        }
+    }
+    parameters {
+        booleanParam(name: 'PUBLISH_RELEASE_TEST', defaultValue: false, description: 'Publishes the current branch to p64h_release_dev')
+        booleanParam(name: 'PUBLISH_RELEASE', defaultValue: false, description: 'Publishes the current branch to p64h_release (CAUTION: this is the official release branch)')
+        booleanParam(name: 'PUSH_TOOLCHAIN_SUBMODULE', defaultValue: true, description: 'Pushes the riscv-gnu-toolchain submodule branch (see .gitmodules_external) from Bitbucket to GitHub before publishing this repo (required whenever the submodule commit changes)')
+        booleanParam(name: 'UPLOAD_TO_GITHUB', defaultValue: false, description: 'Pushes the release branch and artifacts to GitHub (USE WITH CAUTION)')
+        string(name: 'RELEASE_COMMIT_MSG', defaultValue: "", description: 'This is an optional additional commit message that is added to the end of the standard commit message')
+        string(name: 'UPSTREAM_BRANCH', defaultValue: "", description: 'Branch of the upstream p64h-toolchain multi-branch job to pull the build artifacts from (if blank; the current branch is used)')
+        string(name: 'UPSTREAM_BUILD_NUMBER', defaultValue: "", description: 'Build number of the upstream p64h-toolchain job to release (if blank; the last successful build is used). The upstream build must include the Ubuntu22 and Alma9 stages.')
+    }
+    environment {
+        COMPONENT='p64h_toolchain'
+        GITHUB_URL = "git@github.com:pic64-hpsc-hx/p64h-toolchain.git"
+        SUBMODULE_PATH = "riscv-gnu-toolchain"
+        TOOLCHAIN_DISTROS = "ubuntu22 redhat9"
+        USE_GUM=0
+    }
+    options {
+        // Reference: https://jenkins.io/doc/book/pipeline/syntax/#options
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: getNumToKeep(env.JOB_BASE_NAME), artifactNumToKeepStr: getArtifactNumToKeep(env.JOB_BASE_NAME)))
+        timeout(time: 4, unit: 'HOURS')
+        skipDefaultCheckout() // the default checkout recursively clones the riscv-gnu-toolchain submodules (gcc, llvm, ...); see checkoutWithoutSubmodules()
+    }
+    stages { // This line must be stages, parallel {} can exist within a stage, but not before stages { stage('name') { parallel {..}}
+        stage('Setup Workspace') {
+            steps {
+                script {
+                    checkoutWithoutSubmodules()
+                    // These variables require the git clone to have already happened to be populated, so they are set here
+                    env.REPO_NAME=gitUtils.getRepoName(env)
+                    gitUtils.cleanWorkspace()
+                    // Only the top-level submodule is needed for publishing; its own (nested) submodules are not cloned
+                    sh label: "init submodule", script: "git submodule update --init ${env.SUBMODULE_PATH}"
+                    // Remove any nested submodules left in the workspace by a previous (recursive) checkout; otherwise they
+                    // show up as local modifications in the submodule
+                    sh label: "deinit nested submodules", script: "git -C ${env.SUBMODULE_PATH} submodule deinit -f --all; rm -rf \"\$(git -C ${env.SUBMODULE_PATH} rev-parse --git-dir)/modules\""
+                    // Pull build vars from the p64h-toolchain multi-branch pipeline and use the same branch as the current build.
+                    // UPSTREAM_BRANCH overrides the branch; multi-branch job names encode '/' in branch names as %2F
+                    branch_name=params.UPSTREAM_BRANCH?.trim() ?: gitUtils.getBranchName(env)
+                    env.UPSTREAM_PROJ_NAME="/hpsc/${env.COMPONENT.replace("_", "-")}/${branch_name.replace('/', '%2F')}"
+                    echo "Upstream project: ${env.UPSTREAM_PROJ_NAME}"
+                    copyArtifacts(projectName: env.UPSTREAM_PROJ_NAME, filter: "P64hTools-*_build_vars.txt", target: '.', flatten: true, selector: getUpstreamSelector())
+                    archiveArtifacts artifacts: "P64hTools-*_build_vars.txt", fingerprint: true, onlyIfSuccessful: true
+                    // Read build vars from upstream project
+                    build_vars_files = findFiles(glob: "P64hTools-*-redhat9_build_vars.txt")
+                    if (build_vars_files.length == 0) {
+                        error "Unable to find the redhat9 build vars file in ${env.UPSTREAM_PROJ_NAME}; make sure the upstream build ran the Alma9 stage"
+                    }
+                    build_vars_file_name = build_vars_files[0].name
+                    echo "Read build vars from: $build_vars_file_name"
+                    build_vars = readProperties file:build_vars_file_name
+                    // remove the leading 'v' and the trailing '_dev' (added when upstream is built with PUBLISH_RELEASE_TEST) to get the version number
+                    env.VERSION = build_vars.release.replaceFirst(/^v/, '').replaceFirst(/_dev$/, '')
+                    currentBuild.description = "v$env.VERSION | $build_vars.branch_name ($build_vars.git_id_short) | upstream build# $build_vars.build_num"
+                    if (params.UPLOAD_TO_GITHUB) {
+                        // Fetch and validate the GitHub assets before anything is published, so that a missing or
+                        // oversized tarball fails here rather than after the release branches/tags have been pushed.
+                        // They are stored in WORKSPACE_TMP (outside the git workspace) so they are not picked up by
+                        // gitUtils.cleanWorkspace() or the release commit.
+                        env.UPLOAD_DIR = "${env.WORKSPACE_TMP ?: env.WORKSPACE + '@tmp'}/github_assets"
+                        sh label: "clean upload dir", script: "rm -rf '${env.UPLOAD_DIR}'; mkdir -p '${env.UPLOAD_DIR}'"
+                        dir(env.UPLOAD_DIR) {
+                            copyArtifacts(projectName: env.UPSTREAM_PROJ_NAME, filter: "P64hTools-${env.VERSION}-x86_64-linux-*.tar.xz*", target: '.', flatten: true, selector: getUpstreamSelector())
+                        }
+                        env.UPLOAD_FILES = getGithubUploadFiles(env.UPLOAD_DIR)
+                    }
+                }
+            }
+        }
+        stage ("Publish Release") {
+            when { expression { params.PUBLISH_RELEASE == true || params.PUBLISH_RELEASE_TEST == true } }
+            steps {
+                script {
+                    // Return the workspace to a pristine state so that build related files are not included in the release image
+                    gitUtils.cleanWorkspace()
+                    // The submodule must be on GitHub first; gen_release.sh replaces .gitmodules with .gitmodules_external
+                    // and runs 'git submodule add -b <branch> <github url>', which records the tip of that GitHub branch.
+                    if (params.PUSH_TOOLCHAIN_SUBMODULE) {
+                        pushSubmoduleToGithub(env.SUBMODULE_PATH)
+                    }
+                    releaseScripts.generateAndApproveReleaseNotes(env.VERSION, env.REPO_NAME)
+                    releaseScripts.confirmLocalChanges()
+                    sh label: "Switch origin to SSH", script: "git remote set-url origin git@bitbucket.microchip.com:HPSC/p64h-toolchain.git"
+                    releaseScripts.publishRelease(env.VERSION, '.', params.PUBLISH_RELEASE_TEST, false, true, params.RELEASE_COMMIT_MSG)
+                    if (params.UPLOAD_TO_GITHUB) {
+                        releaseScripts.publishToGithub(env.VERSION, env.GITHUB_URL, ".", env.UPLOAD_FILES, params.PUBLISH_RELEASE_TEST)
+                    }
+                }
+            }
+        }
+    } // stages
+}
+
+// Checkout the branch using the job's SCM configuration (url, credentials, branch) but with submodules
+// disabled. The riscv-gnu-toolchain submodule contains very large nested submodules (gcc, llvm, binutils, ...)
+// that are not needed for publishing; cloning them recursively exceeds the checkout timeout.
+def checkoutWithoutSubmodules() {
+    results = checkout([
+        $class: 'GitSCM',
+        branches: scm.branches,
+        userRemoteConfigs: scm.userRemoteConfigs,
+        extensions: [[$class: 'SubmoduleOption', disableSubmodules: true]]
+    ])
+    // skipDefaultCheckout() leaves these unset; they are used by gitUtils/releaseScripts
+    env.GIT_URL = results.GIT_URL
+    env.GIT_BRANCH = results.GIT_BRANCH
+    env.GIT_COMMIT = results.GIT_COMMIT
+    echo "Checked out ${env.GIT_URL} ${env.GIT_BRANCH} (${env.GIT_COMMIT})"
+}
+
+// Push the submodule's branch from Bitbucket to GitHub as-is (the url/branch are read from .gitmodules_external).
+// The submodule is not run through gen_release.sh: it is a fork of the upstream riscv-gnu-toolchain whose nested
+// submodules (gcc, llvm, binutils, ...) already point at public repos, so its history is published unchanged.
+// The branch tip must match the commit pinned in this repo, since 'git submodule add -b <branch>' records the tip.
+def pushSubmoduleToGithub(submodule_path) {
+    submodule_name = gitUtils.getSubmoduleName(submodule_path, ".", ".gitmodules_external")
+    github_url = gitUtils.getSubmoduleUrl(submodule_name, ".", ".gitmodules_external")
+    branch = gitUtils.getSubmoduleBranch(submodule_name, ".", ".gitmodules_external")
+    pinned_commit = gitUtils.getSubmoduleGitHash(submodule_path)
+    dir(submodule_path) {
+        sh label: "fetch ${branch}", script: "git fetch --no-recurse-submodules origin ${branch}"
+        branch_commit = sh(label: "get ${branch} commit", script: "git rev-parse FETCH_HEAD", returnStdout: true).trim()
+        if (branch_commit != pinned_commit) {
+            error "${submodule_path} is pinned to ${pinned_commit} but origin/${branch} is at ${branch_commit}; update the submodule pointer (or the branch in .gitmodules_external) first"
+        }
+        releaseScripts.printCautionBanner()
+        echo "CAUTION: YOU ARE ABOUT TO PUSH ${submodule_path} ${branch} (${branch_commit}) TO ${github_url}"
+        input "Proceed to push ${submodule_path} ${branch} to ${github_url}?"
+        sh label: "push ${branch} to GitHub", script: "git push ${github_url} ${branch_commit}:refs/heads/${branch}"
+    }
+}
+
+// Select a specific upstream build if UPSTREAM_BUILD_NUMBER is provided; otherwise the last successful build
+def getUpstreamSelector() {
+    if (params.UPSTREAM_BUILD_NUMBER?.trim()) {
+        return specific(params.UPSTREAM_BUILD_NUMBER.trim())
+    }
+    return lastSuccessful()
+}
+
+// Verify that the .tar.xz and .sha256 exist for every distro and that each tarball is below GitHub's
+// 2 GiB per-asset limit. Returns the space separated list of (absolute) files to upload.
+def getGithubUploadFiles(upload_dir) {
+    long github_max_asset_size = 2147483648L // 2 GiB
+    upload_files = ""
+    for (distro in env.TOOLCHAIN_DISTROS.split()) {
+        tarfile = "${upload_dir}/P64hTools-${env.VERSION}-x86_64-linux-${distro}.tar.xz"
+        if (!fileExists(tarfile) || !fileExists("${tarfile}.sha256")) {
+            error "Missing ${tarfile} (or its .sha256) from ${env.UPSTREAM_PROJ_NAME}; make sure the upstream build ran the Ubuntu22 and Alma9 stages"
+        }
+        long size = sh(label: "get size of ${distro} tarball", script: "stat -c %s '${tarfile}'", returnStdout: true).trim().toLong()
+        echo "${tarfile}: ${size} bytes (limit ${github_max_asset_size})"
+        if (size >= github_max_asset_size) {
+            error "${tarfile} is ${size} bytes, which exceeds GitHub's 2 GiB release asset limit"
+        }
+        upload_files += "${tarfile} ${tarfile}.sha256 "
+    }
+    sh label: "show artifacts", script: "ls -l ${upload_files}; cat '${upload_dir}'/*.tar.xz.sha256"
+    return upload_files.trim()
+}
+
+def getArtifactNumToKeep(job_base_name) {
+    if (job_base_name =~ /(main)/) {
+        return '30'
+    }
+    return '3'
+}
+
+def getNumToKeep(job_base_name) {
+    if (job_base_name =~ /(main)/) {
+        return '100'
+    }
+    return '10'
+}

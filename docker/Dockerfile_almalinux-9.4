@@ -1,0 +1,78 @@
+# (c) 2022 Microchip Technology Inc.
+# SPDX-License-Identifier: MIT
+
+FROM almalinux:9.5
+USER root
+RUN yum update -y
+RUN yum install epel-release -y
+RUN yum groupinstall -y 'Development Tools'
+RUN yum install -y \
+    bc \
+    csh \
+    glib2-devel.x86_64 \
+    libattr-devel \
+    libcap-ng-devel \
+    libzstd-devel \
+    minicom \
+    ncurses-devel \
+    openldap-devel \
+    pixman \
+    pixman-devel \
+    pv \
+    rsync \
+    vim-common \
+    wget \
+    which \
+    uboot-tools \
+    gnutls-devel \
+    mtools \
+    clang \
+    zlib-devel \
+    libffi-devel \
+    sqlite-devel \
+    bzip2-devel \
+    xz-devel \
+    tk-devel \
+    readline-devel \
+    gdbm-libs \
+    expat-devel 
+
+RUN dnf install -y shadow-utils glibc-langpack-en && rm -rf /var/cache/dnf
+RUN dnf --enablerepo=crb install -y texinfo gmp-devel mpfr-devel
+
+RUN dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+RUN dnf --enablerepo=crb install -y \
+    dtc \
+    gh \
+    git-lfs \
+    libpcap-devel \
+    libslirp-devel \
+    ninja-build \
+    openssl-devel \
+    perl \
+    swig
+
+RUN dnf install -y python3.12 python3.12-pip python3.12-devel
+RUN /usr/bin/python3.12 -m pip install --upgrade pip setuptools wheel xxhash
+
+# Create symlinks for python3 and pip3 to point to Python 3.12
+
+RUN rm -f /usr/bin/python3 && ln -s /usr/bin/python3.12 /usr/bin/python3
+RUN rm -f /usr/local/bin/python3; ln -s /usr/bin/python3.12 /usr/local/bin/python3
+RUN rm -f /usr/bin/pip3 && ln -sf /usr/bin/pip3.12 /usr/bin/pip3
+RUN echo '/usr/local/lib' > /etc/ld.so.conf.d/python3.12.conf && ldconfig
+
+# Install CMake 3.30.3
+ARG CMAKE_VERSION=3.30.3
+RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz && \
+    tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz -C /usr/local --strip-components=1 && \
+    rm -f cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz
+
+# Ruby is required for building the sw-lmstax-labs third-party component within the SysC Firmware
+#   - installing ruby is not required to build the remote API or dev_cfg.
+
+RUN yum install -y ruby ruby-devel
+RUN gem install nokogiri asciidoctor cbor-diag bit-struct packetfu tar json_schemer rspec rexml serialport webrick
+
+ENV USER=root
+WORKDIR /opt/microchip-p64h

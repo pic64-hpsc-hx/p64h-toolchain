@@ -1,0 +1,4 @@
+[submodule "riscv-gnu-toolchain"]
+	path = riscv-gnu-toolchain
+	url = git@github.com:pic64-hpsc-hx/p64h-riscv-gnu-toolchain.git
+	branch = llvm-22-1.8

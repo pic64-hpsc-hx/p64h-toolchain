@@ -1,0 +1,9 @@
+#!groovy
+
+// (c) 2022 Microchip Technology Inc.
+// SPDX-License-Identifier: MIT
+
+// Library below is contained in https://bitbucket.microchip.com/projects/HPSC/repos/hpsc-jenkins-lib/browse
+@Library('hpsc-jenkins-lib@HPSC-8700-release-2.3.0') _
+
+pipelineUpstreamToolchain()
